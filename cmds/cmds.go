@@ -1,9 +1,9 @@
 package cmds
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"github.com/olivere/elastic/v7"
@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 )
 var exportCmd = &cobra.Command{
 	Use:   "export",
@@ -69,7 +70,7 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	}
 	defer inFile.Close()
 
-	var dataReader io.Reader
+	var sourceReader io.Reader
 	if enableGzip{
 		zipReader,err1 := gzip.NewReader(inFile)
 		if err1 != nil {
@@ -78,34 +79,21 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 			}
 			return err
 		}
-		dataReader=zipReader
+		sourceReader=zipReader
 		defer zipReader.Close()
 		log.Println("import gziped file")
 	}else{
-		dataReader= inFile
+		sourceReader= inFile
 		log.Println("import none gziped file")
 	}
 
+	bufReader:=bufio.NewReaderSize(sourceReader,1<<22)
 	iserv:=GetEsIndexService(esUrl,indexName)
-
-	bsLen:=[4]byte{}
-	_,err=io.ReadFull(dataReader,bsLen[:])
-	if err!=nil{
-		return err
-	}
-	dataLen:=binary.BigEndian.Uint32(bsLen[:])
-	//log.Println(dataLen)
 	counter:=0;
-	for  dataLen>0{
+	for line, _, err := bufReader.ReadLine(); err != io.EOF; line, _, err = bufReader.ReadLine() {
 		counter++
-		dataBs:=make([]byte,dataLen)
-		_,err=io.ReadFull(dataReader,dataBs)
-		if err!=nil{
-			return err
-		}
-		//log.Printf("count %d, dataLen:%d",counter,dataLen)
 		item:=new(hitItem)
-		err=json.Unmarshal(dataBs,item)
+		err=json.Unmarshal(line,item)
 		if err != nil {
 			return err
 		}
@@ -117,23 +105,16 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 			_,err=iserv.Do(context.Background())
 			if err != nil {
 				log.Println(err)
+				err=nil
 			}
 			log.Printf("row count %d",counter)
 		}
-
-		bsLen=[4]byte{}
-		_,err=io.ReadFull(dataReader,bsLen[:])
-		if err!=nil{
-			if errors.Is(err,io.EOF){
-				err=nil
-				goto LAST
-			}
-			log.Println("bsLen read err",err)
-			return err
+		if err != nil {
+			log.Println(err)
 		}
-		dataLen=binary.BigEndian.Uint32(bsLen[:])
 	}
-	LAST:
+
+	//LAST:
 	if iserv.NumberOfActions()>0{
 		_,err=iserv.Do(context.Background())
 		if err != nil {
@@ -159,16 +140,18 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		log.Print("open file err", err)
 		return err
 	}
-	var outputWriter io.Writer
+	var targetWriter io.Writer
 	if enableGzip{
 		zip := gzip.NewWriter(ofile)
 		defer zip.Flush()
 		defer zip.Close()
-		outputWriter=zip
+		targetWriter=zip
 	}else{
-		outputWriter=ofile
+		targetWriter=ofile
 	}
 
+	outputWriter:=bufio.NewWriterSize(targetWriter,1<<22)
+	defer outputWriter.Flush()
 	ss:=GetEsScrollService(esUrl,indexName)
 	if matchBody!=""{
 		rawQuery:=elastic.NewRawStringQuery(matchBody)
@@ -177,57 +160,73 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	}
 	pager:=ss.Size(100)//.Query(elastic.MatchAllQuery{})
 	pcounter := 0
-	count:=0
-	bsCounter:=0
-	for{
-		pcounter++;
-		//for test
-		//if pcounter > 5 {
-		//	break
-		//}
-		res,err:=pager.Do(context.Background())
-		if err == nil {
-			for _, hit := range res.Hits.Hits {
-				item:=hitItem{hit.Id,hit.Source}
-				bs,_:=json.Marshal(&item)
-				dataLen := [4]byte{}
-				binary.BigEndian.PutUint32(dataLen[:], uint32(len(bs))+1)
-				_, err = outputWriter.Write(dataLen[:])
-				if err != nil {
-					return err
+	count :=0
+	dataChan :=make(chan interface{},300)
+	fetchTime:=0.0
+	totalFetchTime:=0.0
+	go func() {
+		defer close(dataChan)
+		for {
+			//for test
+			startTime := time.Now()
+			res, err := pager.Do(context.Background())
+			spend:=time.Now().Sub(startTime).Seconds()
+			fetchTime += spend
+			totalFetchTime+=spend
+			pcounter++;
+			if pcounter % 1000 ==0 {
+				log.Println("1000 pages FetchTime", fetchTime, "s")
+				fetchTime=0
+			}
+			if err == nil {
+				for _, hit := range res.Hits.Hits {
+					dataChan <- *hit
+					count++
+					if MaxDocs > 0 && count >= MaxDocs {
+						goto END
+					}
 				}
-				_, err = outputWriter.Write(bs)
-				_, err = outputWriter.Write([]byte("\n"))
-				if err != nil {
-					return err
-				}
-				count++
-				if count>MaxDocs && MaxDocs>0{
-					goto RETURN
-				}
-				bsCounter+=len(bs)
-				if count%10000==0{
-					log.Printf("total exported %d items; total_raw_bytes: %.2f MB", count, getMb(int64(bsCounter)))
+				if len(res.Hits.Hits) < 100 {
+					goto END
 				}
 			}
-			if len(res.Hits.Hits)<100{
-				goto RETURN
+			if err != nil {
+				log.Fatalln("ScrollService err", err)
 			}
 		}
+	END:
+		log.Println("totalFetchTime", totalFetchTime, "s")
+	}()
+
+	storeTime :=0.0
+	bsCounter:=0
+	storeCount :=0
+	for  chanItem := range dataChan {
+		storeCount +=1
+		hit:=chanItem.(elastic.SearchHit)
+		item:=hitItem{hit.Id,hit.Source}
+		bs,_:=json.Marshal(&item)
+		_, err = outputWriter.Write(bs)
+		_, err = outputWriter.Write([]byte("\n"))
 		if err != nil {
-			log.Fatalln("ScrollService err",err)
+			log.Println("io err:",err)
+			break
+		}
+		bsCounter+=len(bs)
+		if storeCount%10000==0{
+			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
+			storeTime =0
 		}
 	}
-	RETURN:
 	if err != nil {
 		log.Print(err)
 	}
 	if  enableGzip {
 		stat, _ := ofile.Stat()
 		fsize := getMb(stat.Size())
-		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", count, getMb(int64(bsCounter)), fsize)
+		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", storeCount, getMb(int64(bsCounter)), fsize)
 	}else{
-		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;", count, getMb(int64(bsCounter)))
+		log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
 	}
 	return err
 }
